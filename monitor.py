@@ -611,14 +611,11 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
     state.setdefault("empty_streak", {})[src] = 0
     state.setdefault("alert_state", {}).pop(src, None)
 
-    # 첫 실행 또는 DGFT UID 체계 전환 직후에는 현재 목록을 기준선으로만 저장한다.
-    # 이 단계에서 메일을 보내면 현재 표에 이미 있는 공고가 매 실행마다 신규처럼 보일 수 있다.
-    if _should_baseline_source(src, seen, state):
-        for it in items:
-            seen.add(it["uid"])
-        state[src] = sorted(seen)
-        log(f"[{src}] 기준선 저장 {len(items)}건 → 이번 실행은 신규 알림 없음")
-        return {"status": "ok", "matched": [], "items_count": count}
+    # 첫 실행 또는 DGFT UID 체계 전환 직후: 현재 목록을 기준선으로 저장한다.
+    # 단, 폭탄 방지는 '매칭 안 된 항목'에만 적용한다.
+    # 동관 키워드에 걸린 항목은 첫 실행이라도 반드시 알림을 보낸다.
+    # (232건 전부가 아니라 copper/chapter74/QCO·BIS 등 매칭된 소수만 발송되므로 폭탄 아님)
+    baseline = _should_baseline_source(src, seen, state)
 
     new_items = [it for it in items if it["uid"] not in seen]
     if not new_items:
@@ -632,9 +629,14 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
             it["keywords"] = kws
             matched.append(it)
 
-    log(f"[{src}] 🆕 신규 {len(new_items)}건 (🔴 매칭 {len(matched)} / ⚪ 무관 {len(new_items)-len(matched)})")
+    if baseline:
+        log(f"[{src}] 기준선 저장 {len(items)}건 "
+            f"(🔴 매칭 {len(matched)}건은 첫 실행이라도 알림 발송)")
+    else:
+        log(f"[{src}] 🆕 신규 {len(new_items)}건 "
+            f"(🔴 매칭 {len(matched)} / ⚪ 무관 {len(new_items)-len(matched)})")
 
-    # 매칭 여부와 무관하게 본 신규는 모두 seen에 넣는다.
+    # 매칭 여부와 무관하게 본 항목은 모두 seen에 넣는다(다음 실행부터 중복 방지).
     for it in new_items:
         seen.add(it["uid"])
     state[src] = sorted(seen)
