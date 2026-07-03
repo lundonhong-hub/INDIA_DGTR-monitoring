@@ -18,7 +18,6 @@ import sys
 import json
 import smtplib
 import datetime
-import subprocess
 from urllib.parse import urljoin
 from html import escape
 from email.mime.text import MIMEText
@@ -67,12 +66,11 @@ SOURCES = {
         "parser": "parse_dgtr",
     },
     "DGFT": {
-        "urls": [
-            "https://www.dgft.gov.in/CP/index.jsp?opt=notification",
-            "https://www.dgft.gov.in/CP/?opt=notification",
-        ],
-        "min_items": 10,
+        # 공식 사이트만 사용. GitHub IP 차단 → ScraperAPI(인도 IP) 경유로 우회.
+        "urls": ["https://www.dgft.gov.in/CP/?opt=notification"],
+        "min_items": 5,   # 공식 1페이지 기본 10건, 최소 5건은 나와야 정상
         "parser": "parse_dgft_official",
+        "via_scraperapi": True,   # 이 소스만 프록시 경유
     },
 }
 
@@ -116,27 +114,69 @@ def log(msg: str) -> None:
 
 
 def load_state() -> dict:
-    default = {"DGTR": [], "DGFT": [], "empty_streak": {}, "last_run": None}
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                log("state.json이 [] 형식 → 전체 초기화로 인식")
-                return default
-            for k in ("DGTR", "DGFT"):
-                data.setdefault(k, [])
-            data.setdefault("empty_streak", {})
-            return data
-        except Exception as e:
-            log(f"⚠️ state.json 읽기 실패, 새로 시작: {e}")
-    return default
+    """
+    state.json 로드.
+
+    중요:
+    - state.json이 없거나 []이면 "현재 화면을 기준선으로만 저장"해야 합니다.
+      그렇지 않으면 GitHub Actions를 수동 실행할 때마다 현재 목록 전체가 신규로 재발송됩니다.
+    - 예전 DGFT 미러 UID(DGFT:sg:...)만 남아 있으면 공식 DGFT UID로 1회 마이그레이션합니다.
+    """
+    default = {
+        "DGTR": [],
+        "DGFT": [],
+        "empty_streak": {},
+        "alert_state": {},
+        "last_run": None,
+        "_needs_baseline": True,
+    }
+
+    if not os.path.exists(STATE_FILE):
+        log("state.json 없음 → 첫 실행 기준선 모드")
+        return default
+
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        # 아주 오래된 PIB식 [] state가 들어온 경우
+        if isinstance(data, list):
+            log("state.json이 []/list 형식 → 첫 실행 기준선 모드")
+            return default
+
+        if not isinstance(data, dict):
+            log("state.json 형식 이상 → 첫 실행 기준선 모드")
+            return default
+
+        for k in ("DGTR", "DGFT"):
+            data.setdefault(k, [])
+            if not isinstance(data[k], list):
+                data[k] = []
+
+        data.setdefault("empty_streak", {})
+        data.setdefault("alert_state", {})
+        data.setdefault("last_run", None)
+        data["_needs_baseline"] = False
+        return data
+
+    except Exception as e:
+        log(f"⚠️ state.json 읽기 실패 → 첫 실행 기준선 모드: {e}")
+        return default
 
 
 def save_state(state: dict) -> None:
-    state["last_run"] = datetime.datetime.now().isoformat()
+    # 내부 플래그는 파일에 저장하지 않음
+    data = dict(state)
+    data.pop("_needs_baseline", None)
+    data.setdefault("DGTR", [])
+    data.setdefault("DGFT", [])
+    data.setdefault("empty_streak", {})
+    data.setdefault("alert_state", {})
+    data["last_run"] = datetime.datetime.now().isoformat()
+
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    log("state.json 저장 완료")
 
 
 def _clean(s: str) -> str:
@@ -159,58 +199,47 @@ def _looks_like_dgft_notification_page(html: str) -> bool:
     )
 
 
-def _fetch_with_requests(url: str) -> str:
+SCRAPERAPI_KEY = os.environ.get("SCRAPERAPI_KEY", "")
+
+
+def _fetch_direct(url: str) -> str:
+    """DGTR 등 직접 접속 가능한 소스용."""
     headers = _headers_for(url)
-    with requests.Session() as s:
-        # DGFT는 첫 접속 쿠키/세션 영향이 있을 수 있어 CP 루트도 먼저 접속
-        if "dgft.gov.in/CP/" in url:
-            try:
-                s.get("https://www.dgft.gov.in/CP/", headers=headers, timeout=20, allow_redirects=True)
-            except Exception:
-                pass
-
-        r = s.get(url, headers=headers, timeout=45, allow_redirects=True)
-        log(f"STATUS {r.status_code}, LEN {len(r.text)}")
-        if r.status_code >= 400:
-            raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
-        return r.text
+    r = requests.get(url, headers=headers, timeout=45, allow_redirects=True)
+    log(f"STATUS {r.status_code}, LEN {len(r.text)}")
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+    return r.text
 
 
-def _fetch_with_curl(url: str) -> str:
-    """GitHub Actions에서 requests는 실패하지만 curl은 통과하는 경우 대비."""
-    log(f"curl retry {url}")
-    cmd = [
-        "curl",
-        "-L",
-        "--compressed",
-        "--retry", "2",
-        "--retry-delay", "2",
-        "--connect-timeout", "20",
-        "--max-time", "60",
-        "-A", BASE_HEADERS["User-Agent"],
-        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "-H", "Accept-Language: en-US,en;q=0.9,ko;q=0.8",
-        "-H", "Referer: https://www.dgft.gov.in/CP/",
-        "-H", "Cache-Control: no-cache",
-        url,
-    ]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=75)
-    html = p.stdout or ""
-    if p.returncode != 0:
-        raise RuntimeError(f"curl failed rc={p.returncode}: {(p.stderr or '')[:200]}")
-    log(f"CURL OK, LEN {len(html)}")
-    return html
+def _fetch_via_scraperapi(url: str) -> str:
+    """DGFT 공식 사이트용. 인도 IP로 대신 요청해 GitHub IP 차단을 우회."""
+    if not SCRAPERAPI_KEY:
+        raise RuntimeError("SCRAPERAPI_KEY 미설정 — GitHub Secrets에 등록 필요")
+    log(f"ScraperAPI 경유 GET {url}")
+    r = requests.get(
+        "https://api.scraperapi.com/",
+        params={
+            "api_key": SCRAPERAPI_KEY,
+            "url": url,
+            "country_code": "in",   # 인도 IP
+            "keep_headers": "true",
+        },
+        headers=DGFT_HEADERS,
+        timeout=90,   # 프록시 경유라 여유있게
+    )
+    log(f"ScraperAPI STATUS {r.status_code}, LEN {len(r.text)}")
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"ScraperAPI HTTP {r.status_code}: {r.text[:200]}", response=r)
+    return r.text
 
 
-def fetch(url: str) -> str:
-    log(f"GET {url}")
-    try:
-        html = _fetch_with_requests(url)
-    except Exception as e:
-        log(f"  ↳ requests 실패: {type(e).__name__}: {e}")
-        if "dgft.gov.in/CP/" not in url:
-            raise
-        html = _fetch_with_curl(url)
+def fetch(url: str, via_scraperapi: bool = False) -> str:
+    log(f"GET {url}" + ("  [via ScraperAPI]" if via_scraperapi else ""))
+    if via_scraperapi:
+        html = _fetch_via_scraperapi(url)
+    else:
+        html = _fetch_direct(url)
 
     # DGFT는 200이어도 차단/오류 HTML일 수 있으므로 내용 검증
     if "dgft.gov.in/CP/" in url and not _looks_like_dgft_notification_page(html):
@@ -219,13 +248,13 @@ def fetch(url: str) -> str:
     return html
 
 
-def fetch_with_fallback(urls: list) -> tuple:
+def fetch_with_fallback(urls: list, via_scraperapi: bool = False) -> tuple:
     for url in urls:
         try:
-            html = fetch(url)
+            html = fetch(url, via_scraperapi=via_scraperapi)
             return html, url
         except Exception as e:
-            log(f"  ↳ 실패, 다음 URL 시도: {type(e).__name__}: {str(e)[:160]}")
+            log(f"  ↳ 실패: {type(e).__name__}: {str(e)[:200]}")
     return None, None
 
 
@@ -488,7 +517,12 @@ def send_structure_alert(src: str, count: int, threshold: int, streak: int, url:
         f"<p>소스 구조/URL 변경 또는 접속 차단 가능성. 점검 필요.</p>"
         f"<p><a href='{escape(url, quote=True)}'>{escape(url)}</a></p>"
     )
-    send_email(subject, body)
+
+    try:
+        send_email(subject, body)
+    except Exception as e:
+        log(f"⚠️ 구조 경고 메일 발송 실패: {type(e).__name__}: {str(e)[:120]}")
+
     send_telegram_text(
         f"⚠️ <b>{escape(src)} 모니터 구조 깨짐 의심</b>\n"
         f"파싱 {count}건 / 임계치 {threshold} / 연속 {streak}회\n"
@@ -507,15 +541,50 @@ def _run_parser(name: str, html: str) -> list:
     raise ValueError(f"unknown parser: {name}")
 
 
+def _should_baseline_source(src: str, seen: set, state: dict) -> bool:
+    """
+    현재 수집된 목록을 '신규'로 보내지 않고 기준선으로만 저장해야 하는지 판단.
+    - 첫 실행 / state.json 초기화
+    - DGFT 미러 UID(DGFT:sg:...) → 공식 UID(DGFT:official:...) 전환 직후
+    """
+    if state.get("_needs_baseline"):
+        return True
+    if not seen:
+        return True
+    if src == "DGFT" and not any(str(x).startswith("DGFT:official:") for x in seen):
+        log("[DGFT] 기존 state가 미러 UID만 보유 → 공식 UID 기준선 마이그레이션")
+        return True
+    if src == "DGTR" and not any(str(x).startswith("DGTR:") for x in seen):
+        return True
+    return False
+
+
+def _should_send_structure_alert(state: dict, src: str, count: int, threshold: int, url: str) -> bool:
+    """
+    구조 깨짐 메일 반복 방지.
+    같은 소스/같은 URL/같은 count에 대한 경고는 상태가 저장된 뒤에는 재발송하지 않습니다.
+    """
+    state.setdefault("alert_state", {})
+    key = f"{src}|count={count}|threshold={threshold}|url={url}"
+    prev = state["alert_state"].get(src)
+    state["alert_state"][src] = key
+    return prev != key
+
+
 def process_source(src: str, cfg: dict, state: dict) -> dict:
     seen = set(state.get(src, []))
-    html, used_url = fetch_with_fallback(cfg["urls"])
+    html, used_url = fetch_with_fallback(cfg["urls"], via_scraperapi=cfg.get("via_scraperapi", False))
 
     if html is None:
         log(f"❌ [{src}] 모든 URL 수집 실패")
-        streak = state["empty_streak"].get(src, 0) + 1
+        streak = state.setdefault("empty_streak", {}).get(src, 0) + 1
         state["empty_streak"][src] = streak
-        send_structure_alert(src, 0, cfg["min_items"], streak, cfg["urls"][0])
+
+        if _should_send_structure_alert(state, src, 0, cfg["min_items"], cfg["urls"][0]):
+            send_structure_alert(src, 0, cfg["min_items"], streak, cfg["urls"][0])
+        else:
+            log(f"[{src}] 동일 구조 경고는 이미 발송됨 → 중복 메일 억제")
+
         return {"status": "failed", "matched": [], "items_count": 0}
 
     items = _run_parser(cfg["parser"], html)
@@ -527,13 +596,29 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
         log(f"    · {it['title'][:95]}")
 
     if count < cfg["min_items"]:
-        streak = state["empty_streak"].get(src, 0) + 1
+        streak = state.setdefault("empty_streak", {}).get(src, 0) + 1
         state["empty_streak"][src] = streak
         log(f"⚠️ [{src}] {count}건 < 임계치 {cfg['min_items']} (연속 {streak}회)")
-        send_structure_alert(src, count, cfg["min_items"], streak, used_url)
+
+        if _should_send_structure_alert(state, src, count, cfg["min_items"], used_url):
+            send_structure_alert(src, count, cfg["min_items"], streak, used_url)
+        else:
+            log(f"[{src}] 동일 구조 경고는 이미 발송됨 → 중복 메일 억제")
+
         return {"status": "failed", "matched": [], "items_count": count}
 
-    state["empty_streak"][src] = 0
+    # 정상 수집으로 회복되면 구조 경고 상태 초기화
+    state.setdefault("empty_streak", {})[src] = 0
+    state.setdefault("alert_state", {}).pop(src, None)
+
+    # 첫 실행 또는 DGFT UID 체계 전환 직후에는 현재 목록을 기준선으로만 저장한다.
+    # 이 단계에서 메일을 보내면 현재 표에 이미 있는 공고가 매 실행마다 신규처럼 보일 수 있다.
+    if _should_baseline_source(src, seen, state):
+        for it in items:
+            seen.add(it["uid"])
+        state[src] = sorted(seen)
+        log(f"[{src}] 기준선 저장 {len(items)}건 → 이번 실행은 신규 알림 없음")
+        return {"status": "ok", "matched": [], "items_count": count}
 
     new_items = [it for it in items if it["uid"] not in seen]
     if not new_items:
@@ -549,6 +634,7 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
 
     log(f"[{src}] 🆕 신규 {len(new_items)}건 (🔴 매칭 {len(matched)} / ⚪ 무관 {len(new_items)-len(matched)})")
 
+    # 매칭 여부와 무관하게 본 신규는 모두 seen에 넣는다.
     for it in new_items:
         seen.add(it["uid"])
     state[src] = sorted(seen)
@@ -566,20 +652,26 @@ def main() -> int:
     total = sum(len(v.get("matched", [])) for v in results_by_source.values())
     any_failed = any(v.get("status") != "ok" for v in results_by_source.values())
 
+    # 중요: 알림 발송보다 state 저장을 먼저 수행.
+    # 메일/텔레그램 전송 중 예외가 나도 다음 실행에서 같은 항목을 다시 보내지 않기 위함.
+    save_state(state)
+
     if total > 0:
         subject, body = build_email(results_by_source)
-        send_email(subject, body)
+        try:
+            send_email(subject, body)
+        except Exception as e:
+            log(f"⚠️ 신규 알림 메일 발송 실패: {type(e).__name__}: {str(e)[:120]}")
         send_telegram_matches(results_by_source)
+
     elif any_failed:
-        log("동관 관련 신규는 없지만 일부 소스 수집 실패")
-        subject, body = build_email(results_by_source)
-        subject = subject.replace("신규 0건 감지", "수집 실패/신규 0건")
-        send_email(subject, body)
-        send_telegram_text("⚠️ 인도 무역규제 모니터: 동관 관련 신규는 없지만 일부 소스 수집 실패")
+        # 구조 경고는 process_source()에서 전환 시점에만 보냄.
+        # 여기서 추가 요약 메일을 보내면 같은 장애에 대해 메일이 2번씩 나간다.
+        log("동관 관련 신규는 없지만 일부 소스 수집 실패 — 구조 경고 중복 발송은 억제")
+
     else:
         log("동관 관련 신규 없음 — 메일 없음")
 
-    save_state(state)
     return 0
 
 
