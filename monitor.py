@@ -3,12 +3,13 @@
 """
 인도 무역규제 모니터 — DGTR + DGFT 공식 사이트 직접 모니터링
 
-핵심 변경:
-- DGFT는 미러 사이트를 사용하지 않음.
-- 공식 DGFT Notification 페이지를 직접 호출:
+- DGTR: 공식 반덤핑 조사 페이지 직접 수집
+- DGFT: 공식 Notification 페이지 직접 수집
   1) https://www.dgft.gov.in/CP/index.jsp?opt=notification
   2) https://www.dgft.gov.in/CP/?opt=notification
-- requests가 DGFT에서 502를 받을 경우, GitHub Actions의 curl로 한 번 더 재시도.
+- DGFT 미러 사이트 사용 안 함
+- 메일 본문에는 DGTR/DGFT를 항상 표시
+- 텔레그램은 설정되어 있을 때만 보조 알림 발송
 """
 
 import os
@@ -66,8 +67,6 @@ SOURCES = {
         "parser": "parse_dgtr",
     },
     "DGFT": {
-        # 중요: /CP/?opt=notification 에서 GitHub Actions가 502를 받는 경우가 있어
-        # index.jsp 명시 URL을 1순위로 사용합니다.
         "urls": [
             "https://www.dgft.gov.in/CP/index.jsp?opt=notification",
             "https://www.dgft.gov.in/CP/?opt=notification",
@@ -111,45 +110,6 @@ NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_USER)
 # ─────────────────────────────────────────────
 # 유틸
 # ─────────────────────────────────────────────
-def send_telegram(matches):
-    """텔레그램으로 알림 발송 (PDF도 첨부)."""
-    token = os.environ.get("TELEGRAM_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
-    if not token or not chat_id:
-        print("[텔레그램] 토큰/chat_id 없음 → 건너뜀")
-        return
-
-    api = f"https://api.telegram.org/bot{token}"
-
-    for m in matches:
-        # 본문 메시지
-        text = (
-            f"🔔 <b>인도 eGazette 신규 공보</b>\n\n"
-            f"[{', '.join(m['_matched'])}] 매칭\n"
-            f"<b>{m['subject'][:200]}</b>\n"
-            f"부처: {m.get('ministry','')}\n"
-            f"ID: {m['gazette_id']}\n"
-            f"PDF: {m.get('_pdf_url','')}"
-        )
-        try:
-            requests.post(f"{api}/sendMessage", data={
-                "chat_id": chat_id, "text": text, "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }, timeout=30)
-
-            # PDF 있으면 문서로 첨부 (텔레그램 한도 50MB — 여유로움)
-            if m.get("_pdf_bytes"):
-                requests.post(f"{api}/sendDocument",
-                    data={"chat_id": chat_id},
-                    files={"document": (pdf_filename(m), m["_pdf_bytes"], "application/pdf")},
-                    timeout=60)
-        except Exception as e:
-            print(f"[텔레그램 전송 실패] {m['gazette_id']}: {str(e)[:60]}")
-
-    print(f"[텔레그램 발송] {len(matches)}건 → chat {chat_id}")
-
-
-
 def log(msg: str) -> None:
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -179,6 +139,10 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+
 def _headers_for(url: str) -> dict:
     if "dgft.gov.in/CP/" in url:
         return DGFT_HEADERS
@@ -198,12 +162,13 @@ def _looks_like_dgft_notification_page(html: str) -> bool:
 def _fetch_with_requests(url: str) -> str:
     headers = _headers_for(url)
     with requests.Session() as s:
-        # DGFT는 첫 접속 쿠키/세션 영향이 있을 수 있어 CP 루트도 먼저 찍습니다.
+        # DGFT는 첫 접속 쿠키/세션 영향이 있을 수 있어 CP 루트도 먼저 접속
         if "dgft.gov.in/CP/" in url:
             try:
                 s.get("https://www.dgft.gov.in/CP/", headers=headers, timeout=20, allow_redirects=True)
             except Exception:
                 pass
+
         r = s.get(url, headers=headers, timeout=45, allow_redirects=True)
         log(f"STATUS {r.status_code}, LEN {len(r.text)}")
         if r.status_code >= 400:
@@ -212,7 +177,7 @@ def _fetch_with_requests(url: str) -> str:
 
 
 def _fetch_with_curl(url: str) -> str:
-    """GitHub Actions에서 requests는 502인데 curl은 통과하는 경우 대비."""
+    """GitHub Actions에서 requests는 실패하지만 curl은 통과하는 경우 대비."""
     log(f"curl retry {url}")
     cmd = [
         "curl",
@@ -247,7 +212,7 @@ def fetch(url: str) -> str:
             raise
         html = _fetch_with_curl(url)
 
-    # DGFT의 경우 200이어도 차단/오류 HTML일 수 있으므로 내용 검증
+    # DGFT는 200이어도 차단/오류 HTML일 수 있으므로 내용 검증
     if "dgft.gov.in/CP/" in url and not _looks_like_dgft_notification_page(html):
         snippet = re.sub(r"\s+", " ", BeautifulSoup(html, "lxml").get_text(" ", strip=True))[:250]
         raise RuntimeError(f"DGFT Notification 표를 찾지 못함: {snippet}")
@@ -270,28 +235,28 @@ def fetch_with_fallback(urls: list) -> tuple:
 def parse_dgtr(html: str) -> list:
     soup = BeautifulSoup(html, "lxml")
     items, seen_local = [], set()
+
     for a in soup.select('a[href*="/anti-dumping-cases/"]'):
         href = a.get("href", "").strip()
         title = a.get_text(" ", strip=True)
         if not href or not title:
             continue
+
         slug = href.rstrip("/").split("/")[-1]
         if not slug or slug in seen_local:
             continue
+
         seen_local.add(slug)
         href = urljoin("https://www.dgtr.gov.in", href)
         items.append({"uid": f"DGTR:{slug}", "title": title, "url": href})
+
     return items
-
-
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
 
 
 def _normalize_dgft_url(href: str) -> str:
     """
     DGFT 메일 링크 정규화.
-    - 공식 PDF(content.dgft.gov.in) 우선 허용
+    - 공식 PDF(content.dgft.gov.in) 허용
     - dgft.gov.in 절대/상대 경로 허용
     - 예전 미러 slug 또는 도메인 없는 html 문자열은 버림
     """
@@ -303,7 +268,7 @@ def _normalize_dgft_url(href: str) -> str:
     if low.startswith(("javascript:", "#", "mailto:")):
         return ""
 
-    if href.startswith("http://") or href.startswith("https://"):
+    if href.startswith(("http://", "https://")):
         if "content.dgft.gov.in/" in low or "dgft.gov.in/" in low:
             return href
         return ""
@@ -311,15 +276,16 @@ def _normalize_dgft_url(href: str) -> str:
     if href.startswith("/"):
         return urljoin("https://www.dgft.gov.in", href)
 
-    # 공식 페이지 안의 상대 경로만 보정. 미러 slug처럼 생긴 값은 버린다.
-    if href.lower().startswith(("website/", "cp/", "dgftprod/")):
+    # 공식 사이트 내부 상대경로만 보정
+    if low.startswith(("website/", "cp/", "dgftprod/")):
         return urljoin("https://www.dgft.gov.in/", href)
 
+    # 예: dgft-public-notice-no-...html 같은 미러/상대 slug는 버림
     return ""
 
 
 def parse_dgft_official(html: str) -> list:
-    """DGFT 공식 Notification 표 직접 파싱. 첨부 버전의 DGFT 수집/파싱 로직 유지."""
+    """DGFT 공식 Notification 표 직접 파싱."""
     soup = BeautifulSoup(html, "lxml")
     items, seen_local = [], set()
 
@@ -329,6 +295,7 @@ def parse_dgft_official(html: str) -> list:
             continue
 
         cells = [_clean(td.get_text(" ", strip=True)) for td in tds]
+
         # 화면 구조:
         # 0 Sl.No, 1 Number, 2 Year, 3 Description, 4 Date, 5 CRT DT, 6 Attachment
         number = cells[1] if len(cells) > 1 else ""
@@ -344,8 +311,9 @@ def parse_dgft_official(html: str) -> list:
             continue
 
         link = ""
-        # Attachment 컬럼 우선. 없으면 row 내 첫 링크 사용.
         link_candidates = []
+
+        # Attachment 컬럼 우선
         if len(tds) >= 6:
             link_candidates.extend(tds[-1].find_all("a", href=True))
         link_candidates.extend(tr.find_all("a", href=True))
@@ -358,8 +326,8 @@ def parse_dgft_official(html: str) -> list:
         uid = f"DGFT:official:{number}:{year}:{date}"
         if uid in seen_local:
             continue
-        seen_local.add(uid)
 
+        seen_local.add(uid)
         title = f"Notification {number} ({date}) - {desc}"
         items.append({
             "uid": uid,
@@ -373,15 +341,18 @@ def parse_dgft_official(html: str) -> list:
 
     return items
 
+
 # ─────────────────────────────────────────────
 # 분류
 # ─────────────────────────────────────────────
 def classify(title: str, source: str) -> list:
     low = title.lower()
     hits = [k for k in KEYWORDS_PRODUCT if k in low]
-    # DGFT는 공식 Notification 제목만으로도 "Chapter 74", "QCO/BIS"를 포착해야 함.
+
+    # DGFT는 Chapter 74뿐 아니라 QCO/BIS도 감시
     if source == "DGFT":
         hits += [k for k in KEYWORDS_REGIME if k in low]
+
     # 중복 제거, 순서 유지
     out = []
     for k in hits:
@@ -408,7 +379,57 @@ def send_email(subject: str, body_html: str) -> None:
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, NOTIFY_TO.split(","), msg.as_string())
+
     log(f"✅ 메일 발송 완료 → {NOTIFY_TO}")
+
+
+def send_telegram_text(text: str) -> None:
+    """텔레그램 텍스트 알림. 설정 없거나 실패해도 모니터 실행을 실패시키지 않음."""
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        log("[텔레그램] 토큰/chat_id 없음 → 건너뜀")
+        return
+
+    api = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        requests.post(
+            api,
+            data={
+                "chat_id": chat_id,
+                "text": text[:3900],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=30,
+        ).raise_for_status()
+        log(f"[텔레그램 발송] chat {chat_id}")
+    except Exception as e:
+        log(f"[텔레그램 전송 실패] {type(e).__name__}: {str(e)[:120]}")
+
+
+def send_telegram_matches(results_by_source: dict) -> None:
+    """현재 DGTR/DGFT item 구조에 맞춘 텔레그램 알림."""
+    matched_rows = []
+    for src in ("DGTR", "DGFT"):
+        result = results_by_source.get(src, {})
+        for it in result.get("matched", []):
+            matched_rows.append((src, it))
+
+    if not matched_rows:
+        return
+
+    lines = [f"🔴 <b>인도 무역규제 — 동관 관련 신규 {len(matched_rows)}건</b>"]
+    for src, it in matched_rows[:20]:
+        kws = ", ".join(it.get("keywords", []))
+        title = escape(it.get("title", "")[:250])
+        url = escape(it.get("url", ""), quote=True)
+        lines.append(f"\n<b>[{src}]</b> {title}")
+        lines.append(f"매칭: <code>{escape(kws)}</code>")
+        if url:
+            lines.append(url)
+
+    send_telegram_text("\n".join(lines))
 
 
 def build_email(results_by_source: dict) -> tuple:
@@ -442,10 +463,13 @@ def build_email(results_by_source: dict) -> tuple:
             kw = ", ".join(it.get("keywords", []))
             title = escape(it.get("title", ""))
             url = it.get("url", "")
+
             parts.append(f"<li><b>{title}</b><br>매칭: <code>{escape(kw)}</code>")
             if url:
                 safe_url = escape(url, quote=True)
                 parts.append(f"<br><a href='{safe_url}'>{escape(url)}</a>")
+            else:
+                parts.append("<br><span style='color:#777'>첨부 링크 없음</span>")
             parts.append("<br><br></li>")
         parts.append("</ul>")
 
@@ -455,16 +479,21 @@ def build_email(results_by_source: dict) -> tuple:
     )
     return subject, "\n".join(parts)
 
+
 def send_structure_alert(src: str, count: int, threshold: int, streak: int, url: str) -> None:
     subject = f"⚠️ [{src} 모니터] 구조 깨짐 의심 — {count}건 (연속 {streak}회)"
     body = (
         f"<h2>⚠️ {src} 파서 이상</h2>"
         f"<p>파싱 {count}건 &lt; 임계치 {threshold}. 연속 {streak}회.</p>"
         f"<p>소스 구조/URL 변경 또는 접속 차단 가능성. 점검 필요.</p>"
-        f"<p><a href='{url}'>{url}</a></p>"
+        f"<p><a href='{escape(url, quote=True)}'>{escape(url)}</a></p>"
     )
     send_email(subject, body)
-    send_telegram(new_matches)
+    send_telegram_text(
+        f"⚠️ <b>{escape(src)} 모니터 구조 깨짐 의심</b>\n"
+        f"파싱 {count}건 / 임계치 {threshold} / 연속 {streak}회\n"
+        f"{escape(url)}"
+    )
 
 
 # ─────────────────────────────────────────────
@@ -493,6 +522,7 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
     count = len(items)
     log(f"[{src}] 파싱 {count}건")
     log(f"[{src}] 사용 URL: {used_url}")
+
     for it in items[:5]:
         log(f"    · {it['title'][:95]}")
 
@@ -502,6 +532,7 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
         log(f"⚠️ [{src}] {count}건 < 임계치 {cfg['min_items']} (연속 {streak}회)")
         send_structure_alert(src, count, cfg["min_items"], streak, used_url)
         return {"status": "failed", "matched": [], "items_count": count}
+
     state["empty_streak"][src] = 0
 
     new_items = [it for it in items if it["uid"] not in seen]
@@ -521,7 +552,9 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
     for it in new_items:
         seen.add(it["uid"])
     state[src] = sorted(seen)
+
     return {"status": "ok", "matched": matched, "items_count": count}
+
 
 def main() -> int:
     state = load_state()
@@ -536,17 +569,19 @@ def main() -> int:
     if total > 0:
         subject, body = build_email(results_by_source)
         send_email(subject, body)
-        send_telegram(new_matches)
+        send_telegram_matches(results_by_source)
     elif any_failed:
         log("동관 관련 신규는 없지만 일부 소스 수집 실패")
         subject, body = build_email(results_by_source)
-        send_email(subject.replace("신규 0건 감지", "수집 실패/신규 0건"), body)
-        send_telegram(new_matches)
+        subject = subject.replace("신규 0건 감지", "수집 실패/신규 0건")
+        send_email(subject, body)
+        send_telegram_text("⚠️ 인도 무역규제 모니터: 동관 관련 신규는 없지만 일부 소스 수집 실패")
     else:
         log("동관 관련 신규 없음 — 메일 없음")
 
     save_state(state)
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
