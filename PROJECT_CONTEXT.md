@@ -1,4 +1,3 @@
-[PROJECT_CONTEXT.md](https://github.com/user-attachments/files/29617844/PROJECT_CONTEXT.md)
 # 인도 무역규제 모니터 (2차 그물) — DGTR + DGFT 통합
 
 인도 무역규제 감시 **3중 그물** 구조의 두 번째 그물.
@@ -25,15 +24,19 @@
 - 고유 ID: 케이스 슬러그(`/anti-dumping-cases/{슬러그}`). 날짜 없어 슬러그로 신규 판단.
 - 항목 링크는 모두 `/anti-dumping-cases/` 포함 → 왼쪽 메뉴 잡링크와 구분.
 
-### DGFT — caalley 미러 경유 ⚠️
+### DGFT — 폴백 체인(미러 다중화) ⚠️
 - **공식 사이트(dgft.gov.in/CP/)는 로그인 대시보드(JS 렌더링)** → requests로 목록 못 긁음.
   공개 JSON 백엔드도 없음. Playwright는 무겁고 셀렉터 취약 → 채택 안 함.
-- **대안: caalley.com이 DGFT 전 카테고리(Notification/PublicNotice/Circular/TradeNotice)를
-  최신순 텍스트로 미러링.** requests로 안정적으로 긁힘. (APEDA 미러는 농산물 편향이라 탈락.)
-- URL: https://caalley.com/legal-updates/corporate-laws/dgft
-- 고유 ID: `카테고리:번호:회계연도`. 번호가 매년 리셋되므로 연도 태그로 충돌 방지.
-- **미러 리스크 관리:** 남의 사이트이므로 "조용한 0건" 방어를 강하게(임계치 15).
-  구조가 바뀌면 즉시 경보. DGTR과 독립적으로 방어(한쪽 깨져도 다른 쪽 정상).
+- **대안: 제3자 미러를 폴백 체인으로 다중화.** 앞 소스가 죽으면 다음 소스 자동 시도.
+  (배포 첫날 caalley가 GitHub Actions IP에서 타임아웃 → 단일 미러 의존 위험 확인됨)
+  1. **stargroup.in** (1순위): 각 공고가 독립 링크(`notification-details-{번호}`) + 요약 내용.
+     HS코드·Chapter·MIP 조건까지 텍스트에 포함. uid=상세페이지 번호로 안정적.
+  2. **caalley.com** (백업): 전 카테고리 텍스트 나열. uid=카테고리:번호:연도.
+  - (APEDA 미러는 농산물 편향이라 탈락.)
+- **미러 리스크 관리:** 폴백 체인 + "조용한 0건" 방어(임계치 15). 전 소스 실패 시에만 경보.
+  DGTR과 독립적으로 방어(한쪽 깨져도 다른 쪽 정상).
+- **개선 여지:** 새 미러 추가는 SOURCES["DGFT"]["urls"] 리스트에 URL만 넣고
+  parse_dgft에 파서 분기 추가하면 됨.
 
 ## 감시 키워드 (monitor.py 상단에서 수정)
 ### (A) 동관 직접 — 양쪽 소스 공통
