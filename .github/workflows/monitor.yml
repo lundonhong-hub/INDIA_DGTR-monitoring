@@ -27,13 +27,14 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run India trade monitor
+      - name: Run DGTR monitor
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_TO: ${{ secrets.NOTIFY_TO }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}       # ← 추가
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}   # ← 추가
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python monitor.py
 
       - name: Commit state.json
