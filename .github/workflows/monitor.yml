@@ -1,4 +1,4 @@
-name: DGTR Monitor
+name: India Trade Monitor (DGTR+DGFT)
 
 on:
   schedule:
