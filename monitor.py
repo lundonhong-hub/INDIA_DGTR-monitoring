@@ -116,69 +116,27 @@ def log(msg: str) -> None:
 
 
 def load_state() -> dict:
-    """
-    state.json 로드.
-
-    중요:
-    - state.json이 없거나 []이면 "현재 화면을 기준선으로만 저장"해야 합니다.
-      그렇지 않으면 GitHub Actions를 수동 실행할 때마다 현재 목록 전체가 신규로 재발송됩니다.
-    - 예전 DGFT 미러 UID(DGFT:sg:...)만 남아 있으면 공식 DGFT UID로 1회 마이그레이션합니다.
-    """
-    default = {
-        "DGTR": [],
-        "DGFT": [],
-        "empty_streak": {},
-        "alert_state": {},
-        "last_run": None,
-        "_needs_baseline": True,
-    }
-
-    if not os.path.exists(STATE_FILE):
-        log("state.json 없음 → 첫 실행 기준선 모드")
-        return default
-
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        # 아주 오래된 PIB식 [] state가 들어온 경우
-        if isinstance(data, list):
-            log("state.json이 []/list 형식 → 첫 실행 기준선 모드")
-            return default
-
-        if not isinstance(data, dict):
-            log("state.json 형식 이상 → 첫 실행 기준선 모드")
-            return default
-
-        for k in ("DGTR", "DGFT"):
-            data.setdefault(k, [])
-            if not isinstance(data[k], list):
-                data[k] = []
-
-        data.setdefault("empty_streak", {})
-        data.setdefault("alert_state", {})
-        data.setdefault("last_run", None)
-        data["_needs_baseline"] = False
-        return data
-
-    except Exception as e:
-        log(f"⚠️ state.json 읽기 실패 → 첫 실행 기준선 모드: {e}")
-        return default
+    default = {"DGTR": [], "DGFT": [], "empty_streak": {}, "last_run": None}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                log("state.json이 [] 형식 → 전체 초기화로 인식")
+                return default
+            for k in ("DGTR", "DGFT"):
+                data.setdefault(k, [])
+            data.setdefault("empty_streak", {})
+            return data
+        except Exception as e:
+            log(f"⚠️ state.json 읽기 실패, 새로 시작: {e}")
+    return default
 
 
 def save_state(state: dict) -> None:
-    # 내부 플래그는 파일에 저장하지 않음
-    data = dict(state)
-    data.pop("_needs_baseline", None)
-    data.setdefault("DGTR", [])
-    data.setdefault("DGFT", [])
-    data.setdefault("empty_streak", {})
-    data.setdefault("alert_state", {})
-    data["last_run"] = datetime.datetime.now().isoformat()
-
+    state["last_run"] = datetime.datetime.now().isoformat()
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    log("state.json 저장 완료")
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def _clean(s: str) -> str:
@@ -530,12 +488,7 @@ def send_structure_alert(src: str, count: int, threshold: int, streak: int, url:
         f"<p>소스 구조/URL 변경 또는 접속 차단 가능성. 점검 필요.</p>"
         f"<p><a href='{escape(url, quote=True)}'>{escape(url)}</a></p>"
     )
-
-    try:
-        send_email(subject, body)
-    except Exception as e:
-        log(f"⚠️ 구조 경고 메일 발송 실패: {type(e).__name__}: {str(e)[:120]}")
-
+    send_email(subject, body)
     send_telegram_text(
         f"⚠️ <b>{escape(src)} 모니터 구조 깨짐 의심</b>\n"
         f"파싱 {count}건 / 임계치 {threshold} / 연속 {streak}회\n"
@@ -554,50 +507,15 @@ def _run_parser(name: str, html: str) -> list:
     raise ValueError(f"unknown parser: {name}")
 
 
-def _should_baseline_source(src: str, seen: set, state: dict) -> bool:
-    """
-    현재 수집된 목록을 '신규'로 보내지 않고 기준선으로만 저장해야 하는지 판단.
-    - 첫 실행 / state.json 초기화
-    - DGFT 미러 UID(DGFT:sg:...) → 공식 UID(DGFT:official:...) 전환 직후
-    """
-    if state.get("_needs_baseline"):
-        return True
-    if not seen:
-        return True
-    if src == "DGFT" and not any(str(x).startswith("DGFT:official:") for x in seen):
-        log("[DGFT] 기존 state가 미러 UID만 보유 → 공식 UID 기준선 마이그레이션")
-        return True
-    if src == "DGTR" and not any(str(x).startswith("DGTR:") for x in seen):
-        return True
-    return False
-
-
-def _should_send_structure_alert(state: dict, src: str, count: int, threshold: int, url: str) -> bool:
-    """
-    구조 깨짐 메일 반복 방지.
-    같은 소스/같은 URL/같은 count에 대한 경고는 상태가 저장된 뒤에는 재발송하지 않습니다.
-    """
-    state.setdefault("alert_state", {})
-    key = f"{src}|count={count}|threshold={threshold}|url={url}"
-    prev = state["alert_state"].get(src)
-    state["alert_state"][src] = key
-    return prev != key
-
-
 def process_source(src: str, cfg: dict, state: dict) -> dict:
     seen = set(state.get(src, []))
     html, used_url = fetch_with_fallback(cfg["urls"])
 
     if html is None:
         log(f"❌ [{src}] 모든 URL 수집 실패")
-        streak = state.setdefault("empty_streak", {}).get(src, 0) + 1
+        streak = state["empty_streak"].get(src, 0) + 1
         state["empty_streak"][src] = streak
-
-        if _should_send_structure_alert(state, src, 0, cfg["min_items"], cfg["urls"][0]):
-            send_structure_alert(src, 0, cfg["min_items"], streak, cfg["urls"][0])
-        else:
-            log(f"[{src}] 동일 구조 경고는 이미 발송됨 → 중복 메일 억제")
-
+        send_structure_alert(src, 0, cfg["min_items"], streak, cfg["urls"][0])
         return {"status": "failed", "matched": [], "items_count": 0}
 
     items = _run_parser(cfg["parser"], html)
@@ -609,29 +527,13 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
         log(f"    · {it['title'][:95]}")
 
     if count < cfg["min_items"]:
-        streak = state.setdefault("empty_streak", {}).get(src, 0) + 1
+        streak = state["empty_streak"].get(src, 0) + 1
         state["empty_streak"][src] = streak
         log(f"⚠️ [{src}] {count}건 < 임계치 {cfg['min_items']} (연속 {streak}회)")
-
-        if _should_send_structure_alert(state, src, count, cfg["min_items"], used_url):
-            send_structure_alert(src, count, cfg["min_items"], streak, used_url)
-        else:
-            log(f"[{src}] 동일 구조 경고는 이미 발송됨 → 중복 메일 억제")
-
+        send_structure_alert(src, count, cfg["min_items"], streak, used_url)
         return {"status": "failed", "matched": [], "items_count": count}
 
-    # 정상 수집으로 회복되면 구조 경고 상태 초기화
-    state.setdefault("empty_streak", {})[src] = 0
-    state.setdefault("alert_state", {}).pop(src, None)
-
-    # 첫 실행 또는 DGFT UID 체계 전환 직후에는 현재 목록을 기준선으로만 저장한다.
-    # 이 단계에서 메일을 보내면 현재 표에 이미 있는 공고가 매 실행마다 신규처럼 보일 수 있다.
-    if _should_baseline_source(src, seen, state):
-        for it in items:
-            seen.add(it["uid"])
-        state[src] = sorted(seen)
-        log(f"[{src}] 기준선 저장 {len(items)}건 → 이번 실행은 신규 알림 없음")
-        return {"status": "ok", "matched": [], "items_count": count}
+    state["empty_streak"][src] = 0
 
     new_items = [it for it in items if it["uid"] not in seen]
     if not new_items:
@@ -647,7 +549,6 @@ def process_source(src: str, cfg: dict, state: dict) -> dict:
 
     log(f"[{src}] 🆕 신규 {len(new_items)}건 (🔴 매칭 {len(matched)} / ⚪ 무관 {len(new_items)-len(matched)})")
 
-    # 매칭 여부와 무관하게 본 신규는 모두 seen에 넣는다.
     for it in new_items:
         seen.add(it["uid"])
     state[src] = sorted(seen)
@@ -665,26 +566,20 @@ def main() -> int:
     total = sum(len(v.get("matched", [])) for v in results_by_source.values())
     any_failed = any(v.get("status") != "ok" for v in results_by_source.values())
 
-    # 중요: 알림 발송보다 state 저장을 먼저 수행.
-    # 메일/텔레그램 전송 중 예외가 나도 다음 실행에서 같은 항목을 다시 보내지 않기 위함.
-    save_state(state)
-
     if total > 0:
         subject, body = build_email(results_by_source)
-        try:
-            send_email(subject, body)
-        except Exception as e:
-            log(f"⚠️ 신규 알림 메일 발송 실패: {type(e).__name__}: {str(e)[:120]}")
+        send_email(subject, body)
         send_telegram_matches(results_by_source)
-
     elif any_failed:
-        # 구조 경고는 process_source()에서 전환 시점에만 보냄.
-        # 여기서 추가 요약 메일을 보내면 같은 장애에 대해 메일이 2번씩 나간다.
-        log("동관 관련 신규는 없지만 일부 소스 수집 실패 — 구조 경고 중복 발송은 억제")
-
+        log("동관 관련 신규는 없지만 일부 소스 수집 실패")
+        subject, body = build_email(results_by_source)
+        subject = subject.replace("신규 0건 감지", "수집 실패/신규 0건")
+        send_email(subject, body)
+        send_telegram_text("⚠️ 인도 무역규제 모니터: 동관 관련 신규는 없지만 일부 소스 수집 실패")
     else:
         log("동관 관련 신규 없음 — 메일 없음")
 
+    save_state(state)
     return 0
 
 
