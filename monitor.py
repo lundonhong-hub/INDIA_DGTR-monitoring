@@ -2,17 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 DGTR/DGFT 인도 무역규제 모니터 (2차 그물)
-- DGTR: 반덤핑 조사 목록 감시 (신규 케이스 감지)
-- 감지 기준: 케이스 슬러그(URL) — 이 목록엔 날짜가 없으므로 날짜 비교 불가
-- copper 키워드 매칭 시 🔴 긴급, 아니면 ⚪ 일반으로 분류
-- state.json으로 중복 방지
-- "조용한 0건" 방어: 파싱 건수가 임계치 미만이면 구조 깨짐으로 보고 경보
+- DGTR 반덤핑 조사 목록 감시 (신규 케이스 감지)
+- 감지 기준: 케이스 슬러그(URL) — 날짜가 없으므로 슬러그로 신규 판단
+- KEYWORDS에 매칭된 것만 메일 발송, 무관 항목은 state만 기록
+- state.json을 [] 로 비우면 전체 재알림 (PIB 방식 통일)
 
 교훈 반영:
   1. 브라우저 UA 필수 (GitHub Actions IP는 통과)
-  2. 조용한 0건 = 최대 위험 → MIN_EXPECTED_ITEMS 안전장치
-  3. 인도는 IS/HS코드로 발표 → 한국 규격코드(KS 등) 무의미, copper 영문 키워드로 감시
-  4. 파싱 전 실제 수신 내용을 로그로 출력해 눈으로 확인
+  2. 조용한 0건 방어: MIN_EXPECTED_ITEMS 미만이면 구조 깨짐 경보
+  3. 한국 규격코드(KS) 무의미 → 인도 영문 제품명으로 감시
+  4. 파싱 전 제목 로그 출력으로 눈 확인
 """
 
 import os
@@ -27,24 +26,27 @@ import requests
 from bs4 import BeautifulSoup
 
 # ─────────────────────────────────────────────
-# 설정
+# 감시 키워드 — 여기만 수정하면 됩니다
+# 인도 반덤핑 공고는 한국 규격코드(KS) 아닌 영문 제품명으로 표기
 # ─────────────────────────────────────────────
-DGTR_URL = "https://www.dgtr.gov.in/en/anti-dumping-investigation-in-india"
-
-# 동관 특화 감시 키워드 (인도가 실제로 쓸 영문 단어 기준)
 KEYWORDS = [
     "copper",
     "copper tube",
+    "copper pipe",
     "copper alloy",
+    "copper rod",
+    "copper strip",
+    "copper wire",
     "refined copper",
     "brass",
     "bronze",
 ]
 
-# 안전장치: 이 목록은 항상 15건이 차 있음. 이보다 크게 적으면 구조 깨짐 의심.
+# ─────────────────────────────────────────────
+# 설정
+# ─────────────────────────────────────────────
+DGTR_URL = "https://www.dgtr.gov.in/en/anti-dumping-investigation-in-india"
 MIN_EXPECTED_ITEMS = 10
-
-# 연속 이상(0건 또는 임계치 미만) N회면 경보 강도 상승
 STATE_FILE = "state.json"
 
 HEADERS = {
@@ -57,7 +59,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# Gmail SMTP (GitHub Secrets에서 주입)
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 NOTIFY_TO = os.environ.get("NOTIFY_TO", GMAIL_USER)
@@ -104,7 +105,7 @@ def fetch_dgtr() -> str:
 
 
 def parse_items(html: str) -> list:
-    """항목 링크는 모두 /anti-dumping-cases/ 를 포함. 왼쪽 메뉴 잡링크와 구분됨."""
+    """항목 링크는 모두 /anti-dumping-cases/ 포함. 왼쪽 메뉴 잡링크와 구분."""
     soup = BeautifulSoup(html, "lxml")
     items = []
     seen_local = set()
@@ -125,7 +126,7 @@ def parse_items(html: str) -> list:
 
 
 def classify(title: str) -> list:
-    """제목에 걸린 copper 키워드 반환 (없으면 빈 리스트)"""
+    """제목에 걸린 키워드 반환 (없으면 빈 리스트)"""
     low = title.lower()
     return [k for k in KEYWORDS if k in low]
 
@@ -149,29 +150,21 @@ def send_email(subject: str, body_html: str) -> None:
     log(f"✅ 메일 발송 완료 → {NOTIFY_TO}")
 
 
-def build_email(urgent: list, normal: list) -> tuple:
-    n_urgent = len(urgent)
-    if n_urgent:
-        subject = f"🔴 [DGTR] copper 관련 반덤핑 조사 {n_urgent}건 감지"
-    else:
-        subject = f"⚪ [DGTR] 신규 반덤핑 조사 {len(normal)}건 (copper 무관)"
-
-    parts = ["<h2>DGTR 반덤핑 조사 신규 감지</h2>"]
-    if urgent:
-        parts.append("<h3 style='color:#c0392b'>🔴 긴급 — copper 관련</h3><ul>")
-        for it in urgent:
-            kw = ", ".join(it["keywords"])
-            parts.append(
-                f"<li><b>{it['title']}</b><br>"
-                f"매칭 키워드: <code>{kw}</code><br>"
-                f"<a href='{it['url']}'>{it['url']}</a></li>"
-            )
-        parts.append("</ul>")
-    if normal:
-        parts.append("<h3 style='color:#555'>⚪ 일반 — 참고</h3><ul>")
-        for it in normal:
-            parts.append(f"<li>{it['title']}<br><a href='{it['url']}'>{it['url']}</a></li>")
-        parts.append("</ul>")
+def build_email(matched: list) -> tuple:
+    n = len(matched)
+    subject = f"🔴 [DGTR] 동관 관련 반덤핑 조사 {n}건 감지"
+    parts = [
+        "<h2>🔴 DGTR 반덤핑 조사 — 동관 관련 신규 감지</h2>",
+        "<ul>",
+    ]
+    for it in matched:
+        kw = ", ".join(it["keywords"])
+        parts.append(
+            f"<li><b>{it['title']}</b><br>"
+            f"매칭 키워드: <code>{kw}</code><br>"
+            f"<a href='{it['url']}'>{it['url']}</a><br><br></li>"
+        )
+    parts.append("</ul>")
     parts.append(
         f"<hr><small>DGTR/DGFT 모니터 (2차 그물) · "
         f"{datetime.datetime.now().strftime('%Y-%m-%d %H:%M')}</small>"
@@ -202,30 +195,27 @@ def main() -> int:
         html = fetch_dgtr()
     except Exception as e:
         log(f"❌ 수집 실패: {e}")
-        # 네트워크 실패는 구조 깨짐과 별개 — 조용히 종료(다음 실행 재시도)
         return 1
 
     items = parse_items(html)
     count = len(items)
     log(f"파싱된 항목: {count}건")
 
-    # 교훈 4: 실제 받아온 제목을 눈으로 확인할 수 있게 상위 몇 개 출력
+    # 교훈 4: 상위 5건 제목 로그 출력
     for it in items[:5]:
         log(f"  · {it['title'][:70]}")
 
-    # 안전장치: 조용한 0건/임계치 미만 방어
+    # 안전장치: 조용한 0건 방어
     if count < MIN_EXPECTED_ITEMS:
         state["empty_streak"] = state.get("empty_streak", 0) + 1
         log(f"⚠️ 파싱 {count}건 < 임계치 {MIN_EXPECTED_ITEMS} "
             f"(연속 {state['empty_streak']}회) → 구조 깨짐 의심")
         send_alert_structure_broken(count, state["empty_streak"])
-        save_state(state)  # seen_slugs는 갱신하지 않음 (오염 방지)
+        save_state(state)
         return 2
     else:
         state["empty_streak"] = 0
 
-    # seen이 비어있으면 첫 실행으로 간주 — 알림 바로 발송
-    # (state.json을 [] 로 비우면 언제든 전체 재알림 가능)
     new_items = [it for it in items if it["slug"] not in seen]
 
     if not new_items:
@@ -233,22 +223,25 @@ def main() -> int:
         save_state(state)
         return 0
 
-    # 신규 항목 분류
-    urgent, normal = [], []
+    # 키워드 매칭된 것만 메일 발송, 무관은 state만 기록
+    matched, unmatched = [], []
     for it in new_items:
         kws = classify(it["title"])
         if kws:
             it["keywords"] = kws
-            urgent.append(it)
+            matched.append(it)
         else:
-            normal.append(it)
+            unmatched.append(it)
 
-    log(f"🆕 신규 {len(new_items)}건 (🔴 긴급 {len(urgent)} / ⚪ 일반 {len(normal)})")
+    log(f"🆕 신규 {len(new_items)}건 (🔴 매칭 {len(matched)} / ⚪ 무관 {len(unmatched)} — state만 기록)")
 
-    subject, body = build_email(urgent, normal)
-    send_email(subject, body)
+    if matched:
+        subject, body = build_email(matched)
+        send_email(subject, body)
+    else:
+        log("키워드 무관 항목만 있음 — 메일 없음, state 갱신만 함")
 
-    # seen 갱신
+    # seen 갱신 (매칭·무관 모두 등록)
     for it in new_items:
         seen.add(it["slug"])
     state["seen_slugs"] = list(seen)
