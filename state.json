@@ -7,6 +7,7 @@
     "DGTR:anti-dumping-investigation-concerning-imports-calcined-gypsum-powder-0",
     "DGTR:anti-dumping-investigation-concerning-imports-calcined-gypsum-powder-originating",
     "DGTR:anti-dumping-investigation-concerning-imports-certain-azepine-intermediates-viz",
+    "DGTR:anti-dumping-investigation-concerning-imports-certain-flat-rolled-products",
     "DGTR:anti-dumping-investigation-concerning-imports-cold-rolled-grain-oriented",
     "DGTR:anti-dumping-investigation-concerning-imports-dialyzers-originating-or-exported",
     "DGTR:anti-dumping-investigation-concerning-imports-electric-tractors-6x4-and-4x2-axle",
@@ -16,9 +17,12 @@
     "DGTR:anti-dumping-investigation-concerning-imports-moulded-soda-lime-glass-vials",
     "DGTR:anti-dumping-investigation-concerning-imports-natural-mica-pearl-industries",
     "DGTR:anti-dumping-investigation-concerning-imports-phenol-saudi-arabia-singapore",
+    "DGTR:anti-dumping-investigation-concerning-imports-polyethylene-terephthalate-film",
     "DGTR:anti-dumping-investigation-concerning-imports-polyethylene-terephthalate-film-0",
     "DGTR:anti-dumping-investigation-concerning-imports-polytetrafluoroethylene-ptfe-0",
+    "DGTR:anti-dumping-investigation-concerning-imports-printed-circuit-board-tools",
     "DGTR:anti-dumping-investigation-concerning-imports-resorcinol-originating-or-1",
+    "DGTR:anti-dumping-investigation-concerning-imports-sodium-hydrosulphite-originating",
     "DGTR:anti-dumping-investigation-concerning-imports-solar-encapsulants-excluding-eva",
     "DGTR:anti-dumping-investigation-concerning-imports-solar-encapsulants-originating-or",
     "DGTR:anti-dumping-investigation-concerning-imports-sublimation-paper-originating-or",
@@ -267,5 +271,5 @@
     "DGFT": 0
   },
   "alert_state": {},
-  "last_run": "2026-07-13T02:08:43.697251"
+  "last_run": "2026-07-13T11:50:07.709716"
 }
